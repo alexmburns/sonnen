@@ -1,0 +1,173 @@
+import requests
+import time
+from datetime import datetime, timedelta
+
+# Local API URL for your Sonnen system
+API_URL = "http://192.168.0.10/api/v1/status" # Replace with your sonnen IP
+ACCESS_TOKEN = ""  # Your Sonnen API key
+
+# Pushover credentials
+PUSHOVER_USER_KEY = " " # Your Pushover User Key
+PUSHOVER_API_KEY = " " # Your Pushover API Key
+
+# Philips Hue light credentials
+BRIDGE_IP = '192.168.0.3' # Your Hue Bridge IP
+USERNAME = '' # Your Hue API key
+LIGHT_ID = 29  # ID for the light you want to turn on
+
+# Logging configuration
+LOG_FILE_PATH = '/home/admin/sonnen.log'
+MAX_LOG_ENTRIES = 100
+
+# Initialize notification states and times
+notified_high = False
+notified_low = False
+last_high_notification = datetime.min
+last_low_notification = datetime.min
+
+# Function to log messages to file and maintain log size
+def log_to_file(message):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_entry = f"{timestamp} - {message}\n"
+
+    # Append the new log entry to the file
+    with open(LOG_FILE_PATH, 'a') as log_file:
+        log_file.write(log_entry)
+
+    # Read all entries from the log file and keep only the last MAX_LOG_ENTRIES
+    with open(LOG_FILE_PATH, 'r') as log_file:
+        entries = log_file.readlines()
+
+    # Keep only the last MAX_LOG_ENTRIES
+    if len(entries) > MAX_LOG_ENTRIES:
+        entries = entries[-MAX_LOG_ENTRIES:]
+
+    # Write the trimmed log entries back to the log file
+    with open(LOG_FILE_PATH, 'w') as log_file:
+        log_file.writelines(entries)
+
+# Function to send a Pushover notification
+def send_pushover_notification(message):
+    try:
+        response = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_API_KEY,
+                "user": PUSHOVER_USER_KEY,
+                "message": message,
+            }
+        )
+        response.raise_for_status()  # Raise an error for bad responses
+        log_to_file(f"Notification sent: {message}")  # Log successful notification
+        print(f"Notification sent: {message}")
+    except requests.exceptions.RequestException as e:
+        log_to_file(f"Error sending notification: {e}")  # Log error in notification
+
+# Function to control the Philips Hue light
+def control_hue_light(state, duration=None):
+    url = f"http://{BRIDGE_IP}/api/{USERNAME}/lights/{LIGHT_ID}/state"
+    payload = {"on": state}
+    
+    try:
+        response = requests.put(url, json=payload)
+        response.raise_for_status()
+        if state:
+            log_to_file("Hue light turned on.")
+            print("Hue light turned on.")
+        else:
+            log_to_file("Hue light turned off.")
+            print("Hue light turned off.")
+            
+        if state and duration:
+            time.sleep(duration)  # Keep the light on for the specified duration
+            control_hue_light(False)  # Turn off the light after the duration
+
+    except requests.exceptions.RequestException as e:
+        log_to_file(f"Error controlling Hue light: {e}")
+
+# Function to get Sonnen data
+def get_sonnen_data():
+    headers = {
+        'Authorization': f'Bearer {ACCESS_TOKEN}',  # Use the provided API key
+    }
+    try:
+        response = requests.get(API_URL, headers=headers)
+        response.raise_for_status()  # Raises an error for bad responses
+        log_to_file("Successfully fetched Sonnen data")  # Log success
+        return response.json()  # Return the API data as JSON
+    except requests.exceptions.RequestException as e:
+        log_to_file(f"Error fetching data: {e}")  # Log error
+        return None
+
+# Function to display Sonnen data in terminal and log it
+def display_sonnen_data(data):
+    battery_charge = data.get('USOC', 'N/A')  # Battery charge percentage
+    production_kw = data.get('Production_W', 0) / 1000  # Convert watts to kW
+    consumption_kw = data.get('Consumption_W', 0) / 1000  # Convert watts to kW
+    grid_kw = abs(data.get('GridFeedIn_W', 0)) / 1000  # Convert watts to kW and remove minus symbol
+
+    # Create and log the message for each metric
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_to_file(f"Battery: {battery_charge}%")
+    log_to_file(f"Solar Production: {production_kw:.1f} kW")
+    log_to_file(f"Consumption: {consumption_kw:.1f} kW")
+    log_to_file(f"Grid Feed-In: {grid_kw:.1f} kW")
+
+    print(f"{timestamp} - Battery: {battery_charge}%")
+    print(f"{timestamp} - Solar Production: {production_kw:.1f} kW")
+    print(f"{timestamp} - Consumption: {consumption_kw:.1f} kW")
+    print(f"{timestamp} - Grid Feed-In: {grid_kw:.1f} kW")
+
+    # Get the current time
+    current_time = datetime.now()
+
+    # Reset notification flags after 12 hours
+    global notified_high, notified_low, last_high_notification, last_low_notification
+    if notified_high and current_time - last_high_notification >= timedelta(hours=12):
+        notified_high = False
+    if notified_low and current_time - last_low_notification >= timedelta(hours=12):
+        notified_low = False
+
+    # Check if battery is above 80% or below 20%, send notification and control light
+    if battery_charge > 80 and not notified_high:
+        if current_time - last_high_notification >= timedelta(hours=12):  # Check if 12 hours have passed
+            message = f"Battery charge is high: {battery_charge}%"
+            send_pushover_notification(message)
+            control_hue_light(True, duration=5)  # Turn on the light for 5 seconds
+            notified_high = True  # Update notification state
+            last_high_notification = current_time  # Update last notification time
+            
+    elif battery_charge < 20 and not notified_low:
+        if current_time - last_low_notification >= timedelta(hours=12):  # Check if 12 hours have passed
+            message = f"Battery charge is low: {battery_charge}%"
+            send_pushover_notification(message)
+            control_hue_light(True, duration=5)  # Turn on the light for 5 seconds
+            notified_low = True  # Update notification state
+            last_low_notification = current_time  # Update last notification time
+
+# Main loop
+refresh_interval = 300  # Refresh data every 300 seconds (5 minutes)
+next_refresh_time = time.time() + refresh_interval
+
+# Fetch initial data to display immediately
+last_sonnen_data = get_sonnen_data()
+if last_sonnen_data:
+    display_sonnen_data(last_sonnen_data)  # Display initial data
+    next_refresh_time = time.time() + refresh_interval
+
+while True:
+    current_time = time.time()
+
+    # Only fetch new data if the refresh interval has passed
+    if current_time >= next_refresh_time:
+        print("Fetching data...")
+        new_data = get_sonnen_data()
+        if new_data:
+            last_sonnen_data = new_data  # Update with new data
+            display_sonnen_data(last_sonnen_data)  # Display updated data
+            next_refresh_time = current_time + refresh_interval
+        else:
+            print("No data returned from Sonnen")
+
+    # Brief pause between cycles to avoid overwhelming the CPU
+    time.sleep(0.1)
