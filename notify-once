@@ -1,0 +1,111 @@
+import requests
+import time
+from datetime import datetime
+import threading
+
+# Local API URL for your Sonnen system
+API_URL = "http://192.168.0.10/api/v1/status" # Replace with your sonnen IP
+ACCESS_TOKEN = ""  # Your Sonnen API key
+
+# Pushover credentials
+PUSHOVER_USER_KEY = " " # Your Pushover User Key
+PUSHOVER_API_KEY = " " # Your Pushover API Key
+
+# Philips Hue light credentials
+BRIDGE_IP = '192.168.0.3' # Your Hue Bridge IP
+USERNAME = '' # Your Hue API key
+LIGHT_ID = 29  # ID for the light you want to turn on
+
+# Monitoring interval (in seconds)
+CHECK_INTERVAL = 300  # 5 minutes
+
+# Battery charge limits
+LOW_THRESHOLD = 81
+HIGH_THRESHOLD = 99
+
+# Shared variable for Sonnen data
+latest_data = {}
+
+# Function to send a Pushover notification
+def send_pushover_notification(message):
+    try:
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_API_KEY,
+                "user": PUSHOVER_USER_KEY,
+                "message": message,
+            }
+        )
+        print(f"Notification sent: {message}")
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending notification: {e}")
+
+# Function to control the Philips Hue light
+def control_hue_light(state, duration=None):
+    url = f"http://{BRIDGE_IP}/api/{USERNAME}/lights/{LIGHT_ID}/state"
+    payload = {"on": state}
+    
+    try:
+        requests.put(url, json=payload)
+        print(f"Hue light turned {'on' if state else 'off'}.")
+        
+        # Turn off light after duration if specified
+        if state and duration:
+            time.sleep(duration)
+            control_hue_light(False)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error controlling Hue light: {e}")
+
+# Function to fetch Sonnen data and update shared variable
+def fetch_sonnen_data():
+    global latest_data
+    headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
+    try:
+        response = requests.get(API_URL, headers=headers)
+        response.raise_for_status()
+        latest_data = response.json()  # Update data
+        print("Successfully fetched Sonnen data")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data: {e}")
+
+# Function to monitor battery level and trigger actions if outside thresholds
+def monitor_battery():
+    while True:
+        # Fetch the latest data
+        fetch_sonnen_data()
+        
+        # Check if valid data has been retrieved
+        if not latest_data:
+            print("No data retrieved; retrying after the interval.")
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        # Get battery charge level
+        battery_charge = latest_data.get('USOC', 0)  # Default to 0 if 'USOC' is missing
+        try:
+            battery_charge = int(battery_charge)
+        except (TypeError, ValueError):
+            battery_charge = 0  # Default to 0 if conversion fails
+
+        print(f"Battery charge level: {battery_charge}%")
+
+        # Trigger notification and light if battery charge is below 81% or above 99%
+        if battery_charge < LOW_THRESHOLD:
+            send_pushover_notification(f"Battery charge is low: {battery_charge}%")
+            control_hue_light(True, duration=10)  # Light on for 10 seconds
+            print("Battery is low; script will now exit.")
+            break  # Exit the loop to close the script
+        
+        elif battery_charge > HIGH_THRESHOLD:
+            send_pushover_notification(f"Battery charge is high: {battery_charge}%")
+            control_hue_light(True, duration=10)  # Light on for 10 seconds
+            print("Battery is high; script will now exit.")
+            break  # Exit the loop to close the script
+
+        # Wait before checking again
+        time.sleep(CHECK_INTERVAL)
+
+# Start the battery monitor check loop
+monitor_battery()
